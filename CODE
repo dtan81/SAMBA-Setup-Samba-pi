@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# setup_samba_pi.sh
+# Samba (SMB) installer/configurer for Raspberry Pi (Raspberry Pi OS)
+# - Default samba/unix user changed to "ki5wtr"
+# - Adds an uninstall mode (-X) that can run non-interactively with -f to remove share, user, data, and purge packages.
+#
+# Usage:
+#   sudo ./setup_samba_pi.sh [options]
+#
+# Install/create share (default interactive):
+#   sudo ./setup_samba_pi.sh
+# Non-interactive example:
+#   sudo ./setup_samba_pi.sh -u ki5wtr -P 'MyS3cureP@ss' -d /home/ki5wtr/shared -s myshare
+#
+# Uninstall/remove share:
+#   sudo ./setup_samba_pi.sh -X        # interactive uninstall flow
+#   sudo ./setup_samba_pi.sh -X -f     # force yes (non-interactive; will remove smb entry, unix user, data, and purge packages)
+#
+# Options:
+#   -u  Samba/UNIX username to use for the share (default: ki5wtr)
+#   -P  Password for the samba user (if omitted the script prompts)
+#   -d  Directory to share (default: /srv/samba/share)
+#   -s  Share name (default: ki5wtr_share)
+#   -g  Make share a guest/public share (no samba user required)
+#   -r  Make share read-only (default: writable)
+#   -X  UNINSTALL mode: remove share block and Samba config entries (interactive)
+#   -f  Force (auto-yes) for uninstall (use with -X) — non-interactive full removal
+#   -h  Show this help
+#
+set -euo pipefail
+
+# Markers for the share block (keep a legacy marker for compatibility with older runs)
+MARKER_BEGIN="# BEGIN ki5wtr-share"
+MARKER_END="# END ki5wtr-share"
+LEGACY_MARKER_BEGIN="# BEGIN pi-share"
+LEGACY_MARKER_END="# END pi-share"
+
+# defaults
+SAMBA_USER="ki5wtr"
+SAMBA_PASSWORD=""
+SHARE_DIR="/srv/samba/share"
+SHARE_NAME="ki5wtr_share"
+GUEST_SHARE=false
+READ_ONLY=false
+UNINSTALL=false
+FORCE_NO_PROMPT=false
+
+SMB_CONF="/etc/samba/smb.conf"
+
+print_help() {
+  sed -n '1,240p' "$0" | sed -n '1,200p'
+}
+
+# Parse options
+while getopts ":u:P:d:s:grXfh" opt; do
+  case ${opt} in
+    u) SAMBA_USER="$OPTARG" ;;
+    P) SAMBA_PASSWORD="$OPTARG" ;;
+    d) SHARE_DIR="$OPTARG" ;;
+    s) SHARE_NAME="$OPTARG" ;;
+    g) GUEST_SHARE=true ;;
+    r) READ_ONLY=true ;;
+    X) UNINSTALL=true ;;
+    f) FORCE_NO_PROMPT=true ;;
+    h) print_help; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; print_help; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; exit 1 ;;
+  esac
+done
+
+# ensure running as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Not running as root. Re-running with sudo..."
+  exec sudo bash "$0" "$@"
+fi
+
+confirm() {
+  # confirm <prompt>
+  if [ "$FORCE_NO_PROMPT" = true ]; then
+    return 0
+  fi
+  read -p "$1 [y/N]: " ans
+  case "$ans" in
+    [Yy]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Helper: remove share block between markers (supports legacy markers too)
+remove_share_block() {
+  local tmp
+  tmp="$(mktemp)"
+  if grep -q "$MARKER_BEGIN" "$SMB_CONF" 2>/dev/null; then
+    awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
+      $0 ~ b {del=1; next}
+      $0 ~ e {del=0; next}
+      !del {print}
+    ' "$SMB_CONF" > "$tmp" && mv "$tmp" "$SMB_CONF"
+    echo "Removed share block between $MARKER_BEGIN and $MARKER_END from $SMB_CONF"
+    return 0
+  elif grep -q "$LEGACY_MARKER_BEGIN" "$SMB_CONF" 2>/dev/null; then
+    awk -v b="$LEGACY_MARKER_BEGIN" -v e="$LEGACY_MARKER_END" '
+      $0 ~ b {del=1; next}
+      $0 ~ e {del=0; next}
+      !del {print}
+    ' "$SMB_CONF" > "$tmp" && mv "$tmp" "$SMB_CONF"
+    echo "Removed legacy share block between $LEGACY_MARKER_BEGIN and $LEGACY_MARKER_END from $SMB_CONF"
+    return 0
+  else
+    echo "No script-managed share block found in $SMB_CONF (no markers)."
+    return 1
+  fi
+}
+
+if [ "$UNINSTALL" = true ]; then
+  echo "=== UNINSTALL MODE ==="
+  echo "This will remove the Samba share block created by this script (if present) and optionally remove the Samba user, unix user, share data, and purge packages."
+
+  # Stop services
+  echo "Stopping samba services..."
+  systemctl stop smbd nmbd 2>/dev/null || true
+  systemctl disable smbd nmbd 2>/dev/null || true
+
+  # Try to restore latest backup if available
+  latest_backup=$(ls -1t /etc/samba/smb.conf.bak.* 2>/dev/null | head -n1 || true)
+  if [ -n "$latest_backup" ]; then
+    if confirm "Found backup $latest_backup. Restore it to $SMB_CONF?"; then
+      cp -a "$latest_backup" "$SMB_CONF"
+      echo "Restored $SMB_CONF from $latest_backup"
+    else
+      echo "Not restoring backup. Attempting to remove share block markers instead."
+      remove_share_block || true
+    fi
+  else
+    echo "No smb.conf backup found. Attempting to remove share block markers instead."
+    remove_share_block || true
+  fi
+
+  # Remove Samba user password entry
+  if smbpasswd -L 2>/dev/null | grep -q "^${SAMBA_USER}:" 2>/dev/null; then
+    if confirm "Remove Samba password entry for user '$SAMBA_USER' (smbpasswd -x)?"; then
+      smbpasswd -x "$SAMBA_USER" || echo "smbpasswd -x returned non-zero (maybe entry didn't exist)."
+    else
+      echo "Skipped removing Samba password entry for $SAMBA_USER."
+    fi
+  else
+    # If smbpasswd -L isn't supported or didn't show, attempt -x anyway but quietly
+    if confirm "Attempt to remove Samba password entry for user '$SAMBA_USER' anyway?"; then
+      smbpasswd -x "$SAMBA_USER" || true
+    fi
+  fi
+
+  # Ask about removing Unix user
+  if id -u "$SAMBA_USER" >/dev/null 2>&1; then
+    if confirm "Remove the system user '$SAMBA_USER'? This will NOT remove home directory unless you choose to remove it in next prompt."; then
+      if confirm "Remove the unix user '$SAMBA_USER' and their home directory as well?"; then
+        deluser --remove-home "$SAMBA_USER" || echo "deluser returned non-zero; user may have been removed already."
+      else
+        deluser "$SAMBA_USER" || echo "deluser returned non-zero; user may have been removed already."
+      fi
+    else
+      echo "Kept unix user $SAMBA_USER."
+    fi
+  else
+    echo "Unix user $SAMBA_USER not found on system."
+  fi
+
+  # Ask about deleting share directory
+  if [ -d "$SHARE_DIR" ]; then
+    if confirm "Delete share directory '$SHARE_DIR' and all its contents?"; then
+      rm -rf "$SHARE_DIR"
+      echo "Deleted $SHARE_DIR"
+    else
+      echo "Kept $SHARE_DIR"
+    fi
+  else
+    echo "Share directory $SHARE_DIR does not exist (or already removed)."
+  fi
+
+  # Ask about purging samba packages
+  if dpkg -l | grep -qi samba; then
+    if confirm "Purge Samba packages (samba, samba-common-bin) and autoremove?"; then
+      apt-get purge -y samba samba-common-bin || echo "apt purge returned non-zero"
+      apt-get autoremove -y || true
+      echo "Samba packages purged."
+    else
+      echo "Left Samba packages installed."
+    fi
+  else
+    echo "Samba packages not found via dpkg."
+  fi
+
+  echo "Restarting systemd (smb) status check..."
+  systemctl daemon-reload || true
+  echo "Uninstall flow complete."
+  exit 0
+fi
+
+# === INSTALL PATH ===
+
+echo "Updating package lists and installing samba (if not present)..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y samba samba-common-bin
+
+# backup smb.conf
+TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+if [ -f "$SMB_CONF" ]; then
+  BACKUP="/etc/samba/smb.conf.bak.$TIMESTAMP"
+  echo "Backing up existing smb.conf to $BACKUP"
+  cp -a "$SMB_CONF" "$BACKUP"
+fi
+
+# Prepare the share directory
+echo "Creating share directory: $SHARE_DIR"
+mkdir -p "$SHARE_DIR"
+
+# If guest share, make it world-writable but controlled permissions
+if [ "$GUEST_SHARE" = true ]; then
+  echo "Configuring directory for guest/public access"
+  chown root:root "$SHARE_DIR"
+  chmod 0775 "$SHARE_DIR"
+else
+  # Ensure UNIX user exists
+  if ! id -u "$SAMBA_USER" >/dev/null 2>&1; then
+    echo "UNIX user $SAMBA_USER does not exist. Creating it (no login password set for system account)..."
+    adduser --disabled-password --gecos "" "$SAMBA_USER"
+  fi
+  echo "Setting ownership of share directory to $SAMBA_USER"
+  chown "$SAMBA_USER":"$SAMBA_USER" "$SHARE_DIR"
+  chmod 0770 "$SHARE_DIR"
+fi
+
+# Build Samba share block
+RO_FLAG="no"
+if [ "$READ_ONLY" = true ]; then
+  RO_FLAG="yes"
+fi
+
+if [ "$GUEST_SHARE" = true ]; then
+  SHARE_BLOCK=$(cat <<EOF
+$MARKER_BEGIN
+[$SHARE_NAME]
+   path = $SHARE_DIR
+   browseable = yes
+   read only = $RO_FLAG
+   guest ok = yes
+   force user = nobody
+   create mask = 0775
+   directory mask = 0775
+$MARKER_END
+EOF
+)
+else
+  SHARE_BLOCK=$(cat <<EOF
+$MARKER_BEGIN
+[$SHARE_NAME]
+   path = $SHARE_DIR
+   valid users = $SAMBA_USER
+   browseable = yes
+   read only = $RO_FLAG
+   guest ok = no
+   create mask = 0770
+   directory mask = 0770
+$MARKER_END
+EOF
+)
+fi
+
+# Remove any existing block between markers (idempotent)
+if grep -q "$MARKER_BEGIN" "$SMB_CONF" 2>/dev/null || grep -q "$LEGACY_MARKER_BEGIN" "$SMB_CONF" 2>/dev/null; then
+  echo "Removing existing samba share block between markers in $SMB_CONF"
+  # Use awk to delete between markers inclusive, write to temp, then move back
+  awk -v b1="$MARKER_BEGIN" -v e1="$MARKER_END" -v b2="$LEGACY_MARKER_BEGIN" -v e2="$LEGACY_MARKER_END" '
+    $0 ~ b1 {del=1; next}
+    $0 ~ e1 {del=0; next}
+    $0 ~ b2 {del=1; next}
+    $0 ~ e2 {del=0; next}
+    !del {print}
+  ' "$SMB_CONF" > "$SMB_CONF.tmp" && mv "$SMB_CONF.tmp" "$SMB_CONF"
+fi
+
+echo "Appending share configuration to $SMB_CONF"
+# Ensure smb.conf ends with newline
+sed -i -e '$a\' "$SMB_CONF"
+printf "%s\n" "$SHARE_BLOCK" >> "$SMB_CONF"
+
+# Configure samba user (if not guest)
+if [ "$GUEST_SHARE" = false ]; then
+  if [ -z "$SAMBA_PASSWORD" ]; then
+    echo "Please provide a password for Samba user '$SAMBA_USER':"
+    read -s -p "Password: " SAMBA_PASSWORD
+    echo
+    read -s -p "Confirm Password: " PASS2
+    echo
+    if [ "$SAMBA_PASSWORD" != "$PASS2" ]; then
+      echo "Passwords do not match. Exiting."
+      exit 1
+    fi
+  fi
+
+  # Add SMB password for the user (non-interactive)
+  printf "%s\n%s\n" "$SAMBA_PASSWORD" "$SAMBA_PASSWORD" | smbpasswd -s -a "$SAMBA_USER" >/dev/null
+  smbpasswd -e "$SAMBA_USER" >/dev/null || true
+  echo "Samba user $SAMBA_USER configured."
+fi
+
+# Restart/enable samba services
+echo "Restarting samba services..."
+if systemctl list-unit-files | grep -q "^smbd"; then
+  systemctl restart smbd
+  systemctl enable smbd >/dev/null 2>&1 || true
+fi
+if systemctl list-unit-files | grep -q "^nmbd"; then
+  systemctl restart nmbd
+  systemctl enable nmbd >/dev/null 2>&1 || true
+fi
+
+echo
+echo "Samba share setup complete."
+echo "Share name: $SHARE_NAME"
+echo "Shared path: $SHARE_DIR"
+if [ "$GUEST_SHARE" = true ]; then
+  echo "Access: guest/public (no password)"
+else
+  echo "Access: user '$SAMBA_USER'. Use the Samba password you set."
+fi
+echo "Read-only: $RO_FLAG"
+echo
+
+echo "Examples to connect:"
+echo " - From Linux:   sudo mount -t cifs //$(hostname -I | awk '{print $1}')/$SHARE_NAME /mnt -o username=$SAMBA_USER"
+echo " - From Windows: In File Explorer, \\\\$(hostname -I | awk '{print $1}')\\\\$SHARE_NAME"
+echo
+echo "To uninstall later (interactive): sudo $0 -X"
+echo "To uninstall later (non-interactive, force): sudo $0 -X -f"
